@@ -3,3 +3,6 @@ ipwhois
 censys
 shodan
 configparser
+netaddr
+validators
+jsonlines

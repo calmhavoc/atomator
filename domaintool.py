@@ -1,5 +1,6 @@
 #!/usr/bin/python
 #pip install ipaddr ipwhois censys shodan
+# apt install golang; go get github.com/anshumanbh/tko-subs
 from ipaddr import IPAddress, IPNetwork
 from ipwhois import IPWhois
 import pprint
@@ -12,12 +13,19 @@ from cmd import Cmd
 import re
 import os
 import threading
-import Queue
+import queue
 import socket
 import configparser
 import json
 from netaddr import IPNetwork
 import functools
+import validators
+import time
+import jsonlines
+import subprocess
+
+
+# sublist3r remove colors sed -i -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g" sublist3r.txt
 
 # TODO: threatcrowd.org API integration
 """
@@ -31,18 +39,11 @@ search:hackertarget.com:output bunch of stuff
 
 # !!! Add certificate check to get domains for each IP
 
-# Set up some validators
 
 
-def is_ipv4(ip):
-    is_valid = re.match("^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$", ip)
-    if is_valid: return True
-    else: return False
-
-def is_valid_hostname(host):
-    is_valid = re.match("^(([a-zA-Z]|[a-zA-Z][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z]|[A-Za-z][A-Za-z0-9\-]*[A-Za-z0-9])$", host)
-    if is_valid: return True
-    else: return False
+def strip_color(line):
+    #return re.sub(r'\^\[\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]','',line)
+    return re.sub(r'\x1b\[[0-9;]*[mGKF]','',line)
 
 def return_ip(line):
     try:
@@ -59,8 +60,8 @@ def catch_exception(f):
         try:
             return f(*args, **kwargs)
         except Exception as e:
-            print 'Caught an exception in', f.__name__
-            print str(e)
+            print ('Caught an exception in', f.__name__)
+            print (str(e))
     return func
 
 
@@ -90,15 +91,17 @@ class Begin(Cmd):
         RISKIQ_USER = config['API']['RISKIQ_USER']
         RISKIQ_SECRET =  config['API']['RISKIQ_SECRET']
     except Exception as e:
-        print str(e)
-        print "No API keys detected, if you wish to use Shodan and Censys, update the config file and re-run"
+        print (str(e))
+        print ("No API keys detected, if you wish to use Shodan and Censys, update the config file and re-run")
 
     def emptyline(self):
         pass
 
+
+
     # @catch_exception
     def ip_in_network(self, ip):
-        print ip
+        print (ip)
         ip = IPAddress(ip)
         for network in target.networks:
             if network != "":
@@ -114,14 +117,15 @@ class Begin(Cmd):
             fqdn = socket.getfqdn(ipaddr)
             return fqdn
         except Exception as e:
-            print str(e)
+            print (str(e))
             return None
 
 
     def add_new_ip(self,ipaddr, source = ""):
         # global target
         ip = ipaddr
-        if is_ipv4(ip):
+        # if is_ipv4(ip):
+        if validators.ipv6(ip) or validators.ipv4(ip):
             if ip not in target.master.keys():
                 target.master[ip]={}
                 target.master[ip]['source']=['{}'.format(source)]
@@ -130,9 +134,9 @@ class Begin(Cmd):
                 target.master[ip]['cidr']=[]
                 target.master[ip]['netname']=[]
             else:
-                print "{} already exists in the table".format(ip)
+                print ("{} already exists in the table".format(ip))
         else:
-            print "{} is not a valid IPv4 address".format(ip)
+            print ("{} is not a valid IPv4 or IPv6 address".format(ip))
 
 
 
@@ -142,9 +146,19 @@ class Begin(Cmd):
     #     return
 
     def do_greet(self,line):
-        print "To get started, add some IPs manually "
+        print ("To get started, add some IPs manually ")
 
+
+    def do_set_wordkingdir(self,wdir):
+        os.chdir(wdir)
+
+    def do_show_curdir(self,line):
+        print(os.getcwd())
+        
     def do_EOF(self,line):
+        return True
+
+    def do_exit(self,line):
         return True
 
     # def do_set_name(self,name):
@@ -155,125 +169,189 @@ class Begin(Cmd):
     #     else:
     #         target = Target(name)
 
+    def do_setup(self):
+        pass
 
     @catch_exception
     def do_initial_osint(self,domain):
         ''' Given a domain, queries multiple sources to find associated IP addresses and subdomains
-        Not yet implemented'''
+        # need to make working dir'''
+        self.do_amass_gather(domain)
+        #self.do_query_censys(domain)
+        self.do_query_riskiq(domain)
+        self.do_query_shodan_domain(domain)
+        self.do_query_shodan_ips()
+
         pass
+
+    def do_amass_gather(self,domain):
+        global target
+        domain = domain
+        amass_cmd = "amass enum -d {0} -ip -o /tmp/amass-domains.txt".format(domain) # need to {0} workdir
+        result = subprocess.run(amass_cmd.split(), stdout=subprocess.PIPE)
+
+        b = result.stdout.decode().split("\n")
+
+        for item in b:
+            if ',' in item:
+                fqdn = item.split(" ")[0]
+                for ip in item.split(' ')[1].split(','):
+                    print("Processing {}:{}".format(ip,item.split()[0]))
+                    try:
+                        self.add_new_ip(ip,source="amass")
+                        if fqdn not in target.master[ip]['fqdns']:
+                            target.master[ip]['fqdns'].append(fqdn)
+                    except Exception as e:
+                        print(str(e))
+            else:
+                fqdn = item.split(" ")[0]
+                ip = item.split(" ")[1]
+                self.add_new_ip(ip,source="amass")
+                if fqdn not in target.master[ip]['fqdns']:
+                    target.master[ip]['fqdns'].append(fqdn)
+
+
+
 
     # @catch_exception
     def do_add_ips_from_file(self,f_ips):
         ''' Add a single IP address manually, or add from a file. Expects a file that contains a single IP address per line
         add_ips <path to file>\nadd_ips 192.168.20.23'''
         global target
-        print f_ips
-        if f_ips == "":
-            f_ips = raw_input("Enter an IP or the full path to text file containing IPs: ")
-        if os.path.isfile('f_ips'):
+        
+        if os.path.isfile(f_ips):
             try:
                 with open(f_ips,'r') as f:
                     ips = f.read().splitlines()
                 for ip in ips:
                     self.add_new_ip(ip,source=str(f_ips))
             except Exception as e:
-                print str(e)
+                print (str(e))
         else:
             self.add_new_ip(f_ips,source="manually added")
 
-    # @catch_exception
-    def do_add_from_discover(self, domain):
+
+    #@catch_exception
+    def do_add_from_amass(self,f):
+        ''' Expects a file comprised of json line data
+        '''
+        with jsonlines.open(f) as f:
+            for obj in f:
+                #try:
+                fqdn = obj['name']
+                ip = obj['addresses'][0]['ip']
+                source = obj['source']
+
+                self.add_new_ip(ip,source=source)
+                if fqdn not in target.master[ip]['fqdns']:
+                    target.master[ip]['fqdns'].append(fqdn)
+
+
+
+    @catch_exception
+    def do_add_from_discover(self, domain=None):
         '''Takes output from 'discover-scripts' found in /root/data/<domaindomain> and adds IP addresses,domains,
         hosts, etc to the db for parsing.
         e.g. parse_discover tigerlabs.net / or parse_discover <enter> to see options
         '''
+        print(domain)
+
+        if domain:
+            folder = domain
 
         #path="/root/data/" 
-        if domain == "":
+        elif domain == "":
             discoverpath = os.path.expanduser('~')+'/data/'
             # options = '\n'.join([str(x) for x in os.listdir(home+'/data')])
             options = '\n'.join([str(x) for x in os.listdir(discoverpath)])
-            print "Enter the domain as found in ~/data/\n--"
-            print options,"\n--"
-            domain = raw_input("?  ")
+            print ("Enter the domain as found in ~/data/\n--")
+            print (options,"\n--")
+            domain = input("?  ")
             folder = discoverpath+domain
 
             if not os.path.isdir(folder):
-                print folder
-                print "The path does not exist, try again\n"
+                print (folder)
+                print ("The path does not exist, try again\n")
                 return 
 
 
-        if os.path.isdir(discoverpath+domain):
-            folder = discoverpath+domain
-            try:
-                hosts = folder+'/data/hosts.htm'
-                with open(hosts,'r') as f:
-                    ips = f.read().splitlines()
-            except:
-                print "Could not read file ",hosts
-                return
+#        if os.path.isdir(discoverpath+domain):
+#            folder = discoverpath+domain
 
-            for ip_addr in ips:
-                ip = return_ip(ip_addr)
-                if ip is not None: # and is_ipv4(ip)):
-                    self.add_new_ip(ip,source="discover")
-                else:
-                    print "Not a valid IP: ",ip
+#        else:
+#            print ("Looking for one of these:\n", '\n'.join([str(x) for x in os.listdir('/root/data')]))
+#            return 
+            
+        try:
+            hosts = folder+'/data/hosts.htm'
+            with open(hosts,'r') as f:
+                ips = f.read().splitlines()
+        except:
+            print ("Could not read file ",hosts)
+            return
 
-            try:
-                subdomains = folder+'/data/subdomains.htm'
-                with open(subdomains,'r') as f:
-                    domains_list = f.read().splitlines()
-                    # print domains_list
-                for line in domains_list:
-                    try:
-                        fqdn = line.split()[0]
-                        ips = line.split()[1:]
-                        for ip in ips:
-                            ip = ip.rstrip(',')
-                            if is_ipv4(ip):
-                                try:
-                                    self.add_new_ip(ip,source="discover")
-                                    if fqdn not in target.master[ip]['fqdns']:
-                                        target.master[ip]['fqdns'].append(fqdn)
-                                except Exception as e:
-                                    print "Error processing ip:{}\n{}".format(ip,str(e))
-                                    # print str(e)
-                    except Exception as e:
-                        print("Failed: "+str(e))
+        for ip_addr in ips:
+            ip = return_ip(ip_addr)
+            if ip is not None and validators.ipv6(ip) or validators.ipv4(ip):# and is_ipv4(ip)):
+                self.add_new_ip(ip,source="discover")
+            else:
+                print ("Not a valid IP: ",ip)
 
-            except:pass
-        else:
-            print "Looking for one of these:\n", '\n'.join([str(x) for x in os.listdir('/root/data')])
+        try:
+            subdomains = folder+'/data/subdomains.htm'
+            with open(subdomains,'r') as f:
+                domains_list = f.read().splitlines()
+                # print domains_list
+            for line in domains_list:
+                try:
+                    fqdn = line.split()[0]
+                    ips = line.split()[1:]
+                    for ip in ips:
+                        ip = ip.rstrip(',')
+                        if validators.ipv6(ip) or validators.ipv4(ip):
+                            try:
+                                self.add_new_ip(ip,source="discover")
+                                if fqdn not in target.master[ip]['fqdns']:
+                                    target.master[ip]['fqdns'].append(fqdn)
+                            except Exception as e:
+                                print ("Error processing ip:{}\n{}".format(ip,str(e)))
+                                # print str(e)
+                except Exception as e:
+                    print("Failed: "+str(e))
 
-    @catch_exception
+        except:pass
+
+
+    #@catch_exception
     def do_add_domains_from_file(self,f_domains):
         ''' Expects a file that has a domain on each line
         eg: ns1.mydomain.com '''
         with open(f_domains,'r') as f:
             domains_list = f.read().splitlines()
-            # print domains_list
-        # for line in domains_list:
-        for fqdn in domains_list:
-            print fqdn
-            # fqdn = line.split()[0]
-            # ip = line.split()[1]
-            hosts = socket.gethostbyname_ex(fqdn)[2]
-            for ip in hosts:
-                try:
-                    self.add_new_ip(ip,source="file:{}".format(str(f_domains)))
-                    if fqdn not in target.master[ip]['fqdns']:
-                        target.master[ip]['fqdns'].append(fqdn)
 
+        for fqdn in domains_list:
+            if validators.domain(fqdn):
+                try:
+                    hosts = socket.gethostbyname_ex(fqdn)[2]
+
+                    for ip in hosts:
+                        try:
+                            self.add_new_ip(ip,source="file:{}".format(str(f_domains)))
+                            if fqdn not in target.master[ip]['fqdns']:
+                                target.master[ip]['fqdns'].append(fqdn)
+
+                        except Exception as e:
+                            print ("Error processing ip:{}\n{}".format(ip,str(e)))
                 except Exception as e:
-                    print "Error processing ip:{}\n{}".format(ip,str(e))
-                #     # print str(e)
+                    pass
+                    #     # print str(e)
+            else:
+                print("Invalid: {}".format(fqdn))
 
 
 
     @catch_exception
-    def do_query_shodan(self,searchstring):
+    def do_query_shodan_domain(self,searchstring):
         '''Runs a shodan query on a provided domain
         e.g. shodan_query tigerlabs.net'''
         API_KEY = self.SHODAN_API_KEY
@@ -285,13 +363,41 @@ class Begin(Cmd):
                 ip = service['ip_str']
                 port = service['port']
                 fqdn = socket.getfqdn(ip)
-                print "{}\t{}\t{}".format(ip,fqdn,port)
+                print ("Adding {}\t{}\t{}".format(ip,fqdn,port))
 
-            question = raw_input("Would you like to add these to the table? (Y/n): ")
-            if question.lower() == "y":
+                self.add_new_ip(ip,source="{}".format('shodan'))
+                # print "Adding {},{},{}".format(ip,fqdn,port)
+
+                if fqdn not in target.master[ip]['fqdns']:
+                    target.master[ip]['fqdns'].append(fqdn)
+
+                if port not in target.master[ip]['ports']:
+                    target.master[ip]['ports'].append(str(port))
+
+        except Exception as e:
+            print ('Error in Shodan: %s' % str(e))
+
+
+    @catch_exception
+    def do_query_shodan_ips(self, line):
+        API_KEY = self.SHODAN_API_KEY
+        api = shodan.Shodan(API_KEY)
+
+
+        for ip in target.master.keys():
+            try:
+                time.sleep(1)
+                query = "ip:"+ip #' '.join(searchstring)
+                result = api.search(query)
+                print("Querying: ",ip)
                 for service in result['matches']:
                     ip = service['ip_str']
                     port = service['port']
+                    fqdn = socket.getfqdn(ip)
+                    print ("Adding: {}\t{}\t{}".format(ip,fqdn,port))
+
+
+
 
                     # Adding IP, and associated domains and ports 
                     self.add_new_ip(ip,source="{}".format('shodan'))
@@ -304,8 +410,12 @@ class Begin(Cmd):
                         target.master[ip]['ports'].append(str(port))
 
 
-        except Exception as e:
-            print 'Error: %s' % str(e)
+            except Exception as e:
+                print('Error in Shodan IP search: {}'.format(e))
+
+            
+
+
 
     @catch_exception
     def do_query_censys(self,searchstring):
@@ -323,36 +433,24 @@ class Begin(Cmd):
                 ip = result.get('ip')
                 ports = result.get('protocols')#[0].split('/')[0]
                 fqdn = socket.getfqdn(ip)
-                print "{},{},{}".format(ip, fqdn, ports)
+                print ("{},{},{}".format(ip, fqdn, ports))
 
-            question = raw_input("Would you like to add these to the table? (Y/n): ")
-
-            if question.lower() == "y":
-                results = api.search(searchstring)
-                for result in results:
-                    try:
-                        ip = result.get('ip')
-                        ports = result.get('protocols')#[0].split('/')[0]
-                        fqdn = socket.getfqdn(ip)
-
-                        self.add_new_ip(ip,source="{}".format('censys'))
+                self.add_new_ip(ip,source="{}".format('censys'))
                         # print "Adding {},{},{}".format(ip,fqdn,ports)
 
-                        if fqdn not in target.master[ip]['fqdns']:
-                            target.master[ip]['fqdns'].append(fqdn)
+                if fqdn not in target.master[ip]['fqdns']:
+                    target.master[ip]['fqdns'].append(fqdn)
 
-                        for port in ports:
-                            p = port.split('/')[0]
-                            if p not in target.master[ip]['ports']:
-                                target.master[ip]['ports'].append(p)
+                for port in ports:
+                    p = port.split('/')[0]
+                    if p not in target.master[ip]['ports']:
+                        target.master[ip]['ports'].append(p)
 
                             
-                    except Exception as e:
-                        print "Error in censys: ",str(e)
-
-
         except Exception as e:
-            print 'Error: %s' % str(e)
+            print ("Error in censys: ",str(e))
+
+
 
 
     @catch_exception
@@ -377,18 +475,18 @@ class Begin(Cmd):
         domain_list = pdns_results_example['subdomains']
         for subdomain in domain_list:
             fqdn = "{}.{}".format(subdomain,domain)
-            print fqdn
+            print (fqdn)
             try:
                 ips = socket.gethostbyname_ex(fqdn)[2]
                 for ip in ips:
                     try:
-                        print "{}\t{}".format(ip,fqdn)
+                        print ("{}\t{}".format(ip,fqdn))
                         self.add_new_ip(ip,source="{}".format('riskiq'))
                         if ip in target.master.keys():
                             target.master[ip]['fqdns'].append(fqdn)
 
                     except Exception as e:
-                        print "Error processing ip:{}\n{}".format(ip,str(e))
+                        print ("Error processing ip:{}\n{}".format(ip,str(e)))
             except socket.gaierror as e:
                 # print str(e)
                 pass
@@ -404,7 +502,7 @@ class Begin(Cmd):
         threads = 10
         resume = None
 
-        print "Performing lookup on {} addresses".format(len(target.master.keys()))
+        print ("Performing lookup on {} addresses".format(len(target.master.keys())))
         
         def myfunct(my_queue):
             # for ip in target.master.keys():
@@ -413,44 +511,39 @@ class Begin(Cmd):
                 ip_list = my_queue.get()
                 for ip in ip_list:
                     # print ip
-                    print '\rItem: {}: {}'.format(ip, total),
+                    print ('\rItem: {}: {}'.format(ip, total)),
                     try:
                         with warnings.catch_warnings():
                             warnings.filterwarnings("ignore", category=UserWarning)
                             whoisObj = IPWhois(ip)
                             whois = whoisObj.lookup_whois
                             try:
-                            	for netw in whois()['nets']:
-		                       	    netname = netw['description']
-		                            cidr = netw['cidr']
-		                            target.master[ip]['netname']=netname
-		                            target.master[ip]['cidr']=cidr
-		                            if "whois" not in target.master[ip]['source']:
-		                                target.master[ip]['source'].append('whois')
-		                            if (netname,cidr) not in target.netnames:
-		                                target.netnames.append((netname,cidr))
+                                for netw in whois()['nets']:
+                                    netname = netw['description']
+                                    cidr = netw['cidr']
+                                    target.master[ip]['netname']=netname
+                                    target.master[ip]['cidr']=cidr
+                                    if "whois" not in target.master[ip]['source']:
+                                        target.master[ip]['source'].append('whois')
+                                    if (netname,cidr) not in target.netnames:
+                                        target.netnames.append((netname,cidr))
                             except:
-                            	print "Exception for : ",ip
-	                            # netname = whois()['nets'][0]['description']
-	                            # cidr = whois()['nets'][0]['cidr']
-	                            # target.master[ip]['netname']=netname
-	                            # target.master[ip]['cidr']=cidr
-	                            # if "whois" not in target.master[ip]['source']:
-	                            #     target.master[ip]['source'].append('whois')
-	                            # if (netname,cidr) not in target.netnames:
-	                            #     target.netnames.append((netname,cidr))
+                                print ("Exception for : ",ip)
+
                     except Exception as e:
-                        print "\nFailed to process: {}".format(ip)
-                        print str(e)
+                        print ("\nFailed to process: {}".format(ip))
+                        print (str(e))
                     # i+=1
                 # return 0
-            print "Thread completed"
+            tcount +=1
+            print ("{}/10 Threads completed".format(str(tcount)))
 
-        my_queue = Queue.Queue()
+        my_queue = queue.Queue()
         queue_size = my_queue.qsize()
         for ip in target.master.keys():
             my_queue.put([ip])
 
+        tcount = 0
         for j in range(threads):
             t = threading.Thread(target=myfunct, args=(my_queue,))
             t.start()
@@ -460,7 +553,7 @@ class Begin(Cmd):
         '''Does a host lookup on each address in the netrange. quer_hostnames 12.2.1.0/30'''
 
         for ip in IPNetwork(cidr):
-            print self.get_rhost(str(ip))
+            print (self.get_rhost(str(ip)))
 
 
     @catch_exception
@@ -468,9 +561,9 @@ class Begin(Cmd):
         ''' Add a known CIDR owned by the target eg: 8.8.8.0/23 '''
         ip=cidr.split('/')[0];whoisObj = IPWhois(ip);whois = whoisObj.lookup_whois
         for x in whois()['nets']:
-        	print x['description']
+            print (x['description'])
 
-        host_lookup = raw_input("Do a host lookup on each address (y/n)? ")
+        host_lookup = input("Do a host lookup on each address (y/n)? ")
 
         if cidr != "":
             target.networks.append(cidr)
@@ -478,8 +571,8 @@ class Begin(Cmd):
 
 
         else:
-            print "You have to specify a cidr"
-            netrange = raw_input("Network? (eg:192.168.0.1/30)")
+            print ("You have to specify a cidr")
+            netrange = input("Network? (eg:192.168.0.1/30)")
 
 
         if cidr != "":
@@ -491,7 +584,7 @@ class Begin(Cmd):
 
                     if fqdn not in target.master[ip]['fqdns']:
                         target.master[ip]['fqdns'].append(fqdn)
-                        print "Added: {}\t{}".format(ip,fqdn)
+                        print ("Added: {}\t{}".format(ip,fqdn))
             else:
                 for ip in netrange:
                     ip = str(ip)
@@ -513,10 +606,10 @@ class Begin(Cmd):
             for val in master[ip]:
                 for item in master[ip][val]:
                     if searchstring in item:
-                        print searchstring
-                        print item
+                        print (searchstring)
+                        print (item)
                         master[ip][val].remove(item)
-                        print "Removed {} from {}".format(item,ip)
+                        print ("Removed {} from {}".format(item,ip))
 
 
 
@@ -530,19 +623,19 @@ class Begin(Cmd):
             ip = str(ip)
             if ip in target.master.keys():
                 del target.master[ip]
-                print "Removed: {}".format(ip)
+                print ("Removed: {}".format(ip))
 
 
     @catch_exception
     def do_show_ips(self,line):
         ''' 'Shows all single IP addresses discovered '''
-        print target.all_ips
+        print (target.all_ips)
 
 
     @catch_exception
     def do_show_master(self,line):
         ''' Shows the complete dictionary table that has so for been added to the current session'''
-        print target.master
+        print (target.master)
 
 
     @catch_exception
@@ -553,7 +646,7 @@ class Begin(Cmd):
         if nmap == "":
             nmap = "-sV --top-ports=100"
         for ip in master:
-            print "nmap {} {}".format(ip,nmap)
+            print ("nmap {} {}".format(ip,nmap))
 
 
 
@@ -562,13 +655,13 @@ class Begin(Cmd):
         '''Displays network block names and associated network ranges in the table.
         This is so you don't have to run get_netinfo again unless you've added additional IP addresses '''
         target.netnames.sort()
-        for netname in target.netnames:print netname
+        for netname in target.netnames:print (netname)
 
 
     @catch_exception
     def do_print_json(self,line):
         ''' Prints the current working table to the screen in json format'''
-        print json.dumps(target.master,indent=1)
+        print (json.dumps(target.master,indent=1))
 
 
     @catch_exception
@@ -587,9 +680,9 @@ class Begin(Cmd):
                 cidr = ""
                 netname = ""
             try: 
-                print "{},{},{},{}".format(str(ip),str(fqdns),str(ports),str(sources))
+                print ("{},{},{},{}".format(str(ip),str(fqdns),str(ports),str(sources)))
             except Exception as e:
-                print "Error printing CSV: ",str(e)
+                print ("Error printing CSV: ",str(e))
 
 
     @catch_exception
@@ -599,12 +692,10 @@ class Begin(Cmd):
         master = target.master
         for ip in sorted(master.keys()):
             for fqdn in master[ip]['fqdns']:
-                if is_ipv4(fqdn) or 'arpa' in fqdn:
+                if validators.ipv6(ip) or validators.ipv4(ip) or 'arpa' in fqdn:
                     invalid.append('{}\t{}'.format(ip,fqdn))
                 else:
-                    # ports = ",".join(master[ip]["ports"])
-                    # print "{}\t{}\t{}".format(str(ip),str(ports),str(fqdn))
-                    print "{}\t{}".format(str(ip),str(fqdn))
+                    print ("{}\t{}".format(str(ip),str(fqdn)))
 
          # Need to add additional report items: unique IPs with totals, IPs to networks (aws, google, etc) 
 
@@ -675,11 +766,11 @@ class Begin(Cmd):
             fqdn = ''
             netname = ''
             sources = ''
-            if current.has_key('fqdn'):
+            if current.__contains__('fqdn'):
                 fqdn = current['fqdn']
-            if current.has_key('netname'):
+            if current.__contains__('netname'):
                 netname=current['netname']
-            if current.has_key('source'):
+            if current.__contains__('source'):
                 sources = " ".join(current['source'])
                 # print sources
             # f.write(xml_host.format(hid,ip_addr,fqdn,sources,netname))
@@ -688,7 +779,7 @@ class Begin(Cmd):
             # id={0}
             # address={1}
             # comments={2}'''.format(hid,ip_addr,netname)
-            if current.has_key('ports'):
+            if current.__contains__('ports'):
                 f.write('<services>\n')
                 for port in current['ports']:
                     f.write(xml_svc.format(hid,port))
@@ -708,7 +799,6 @@ class Begin(Cmd):
         IP Address , Ports , FQDN , sources , netname , CIDR '''
         f = open('./'+name,'w')
         f.write("IP Address,Ports,FQDN,sources,netname,CIDR\n")
-        hid = 1
         for key in target.master.keys():
             try:
                 current = target.master[key]
@@ -719,24 +809,24 @@ class Begin(Cmd):
                 ports = ''
                 cidr = ''
 
-                if current.has_key('fqdns'):
+                if current.__contains__('fqdns'):
                     # fqdn = current['fqdns']
                     fqdn = '|'.join(str(p) for p in (current['fqdns']))
-                if current.has_key('netname'):
+                if current.__contains__('netname'):
                     netname=current['netname']
-                if current.has_key('source'):
+                if current.__contains__('source'):
                     sources = " ".join(current['source'])
                     # print sources
-                if current.has_key('ports'):
+                if current.__contains__('ports'):
                     ports = '|'.join(str(p) for p in (current['ports']))
 
-                if current.has_key('cidr'):
+                if current.__contains__('cidr'):
                     cidr=current['cidr']
 
 
                 f.write("{},{},{},{},{}\n".format(ip_addr,ports,fqdn,sources,netname,cidr))
             except Exception as e:
-                print "Error in csv: {}".format(e)
+                print ("Error in csv: {}".format(e))
         f.close()
 
 
@@ -759,7 +849,7 @@ class Begin(Cmd):
     def do_interact(self,line):
         ''' Drop to a python shell to interact with the current dataset.\n ** CTRL-D returns to workspace, exit() kills the space ** '''
         import code
-        print "CTRL-D to exit\n"
+        print ("CTRL-D to exit\n")
         # global target
         try:
             code.interact(local=dict(globals(), **locals()))
@@ -775,8 +865,8 @@ class Begin(Cmd):
         """
         try:
             exec(line) in self._locals, self._globals
-        except Exception, e:
-            print e.__class__, ":", e
+        except Exception as e:
+            print (e.__class__, ":", e)
 
 
 if __name__ == '__main__':
