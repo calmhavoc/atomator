@@ -657,7 +657,23 @@ class Begin(Cmd):
         target.netnames.sort()
         for netname in target.netnames:print (netname)
 
+            
+    def do_print_domains(self,line):
+        domains = []
+        # master = target.master.keys()
+        for ip in target.master.keys():
+            for domain in target.master[ip]['fqdns']:
+                if validators.ipv6(domain) or validators.ipv4(domain) or 'arpa' in domain:
+                    pass
+                else:
+                    domains.append(domain)
 
+        unique_domains = set(domains)
+        for i in unique_domains: print(i)
+        
+        print("Total:\t{}").format(len(unique_domains))
+        
+        
     @catch_exception
     def do_print_json(self,line):
         ''' Prints the current working table to the screen in json format'''
